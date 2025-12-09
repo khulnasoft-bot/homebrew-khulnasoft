@@ -1,0 +1,309 @@
+name: Update dev-tools formula
+
+# Only one workflow run at a time, cancel in-progress runs when new commits are pushed
+concurrency:
+  group: "update-${{ github.ref }}"
+  cancel-in-progress: true
+
+on:
+  schedule:
+    - cron: "0 */6 * * *" # Every 6 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force update check, ignoring cache'
+        required: false
+        default: 'false'
+      skip-notification:
+        description: 'Skip sending notifications for this run'
+        required: false
+        default: 'false'
+
+jobs:
+  update:
+    name: Update dev-tools
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_CACHE: ${{ github.workspace }}/.homebrew-cache
+      
+    # Set a timeout of 30 minutes to prevent hanging workflows
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Homebrew packages
+        uses: actions/cache@v3
+        id: brew-cache
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            ${{ github.workspace }}/.homebrew-cache
+            ${{ github.workspace }}/.bundle
+          key: ${{ runner.os }}-brew-${{ hashFiles('**/Gemfile.lock') }}-${{ hashFiles('**/Brewfile.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-brew-
+            
+      - name: Install required dependencies
+        run: |
+          # Create cache directory if it doesn't exist
+          mkdir -p "$HOMEBREW_CACHE"
+          
+          # Install required tools
+          brew install jq gh
+          
+          # Configure git
+          git config --global --add safe.directory /github/workspace
+          
+          # Set up GitHub CLI authentication
+          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+
+      - name: Make scripts executable
+        run: |
+          chmod +x brew-update.sh
+          chmod +x calculate-sha256.sh || true
+
+      - name: Run update check
+        id: update
+        continue-on-error: true
+        run: |
+          set +e
+          if [[ "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force == 'true' }}" == "true" ]]; then
+            ./brew-update.sh --verbose --force
+          else
+            ./brew-update.sh --verbose
+          fi
+          EXIT_CODE=$?
+          
+          # Handle different exit codes
+          case $EXIT_CODE in
+            0) echo "status=success" >> $GITHUB_OUTPUT ;;
+            1) echo "status=error" >> $GITHUB_OUTPUT ;;
+            2) echo "status=dependency_error" >> $GITHUB_OUTPUT ;;
+            3) echo "status=version_check_failed" >> $GITHUB_OUTPUT ;;
+            *) echo "status=unknown_error" >> $GITHUB_OUTPUT ;;
+          esac
+          
+          exit $EXIT_CODE
+
+      - name: Check for changes
+        if: steps.update.outcome == 'success' || steps.update.outcome == 'failure'
+        id: git-status
+        run: |
+          if git diff --quiet; then
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo "No changes to commit"
+          else
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+            echo "Changes detected, preparing to commit..."
+            
+            # Show the changes for debugging
+            git diff --name-status
+            
+            # Configure git
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            
+            # Add all changed files
+            git add .
+            
+            # Create commit
+            if git commit -m "chore: update dev-tools formula [skip ci]"; then
+              echo "commit_created=true" >> $GITHUB_OUTPUT
+            else
+              echo "commit_created=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Push changes
+        if: steps.git-status.outputs.changes_detected == 'true' && steps.git-status.outputs.commit_created == 'true'
+        run: |
+          echo "Pushing changes to repository..."
+          if git push; then
+            echo "Changes pushed successfully"
+          else
+            echo "Failed to push changes"
+            exit 1
+          fi
+
+      - name: Handle failure
+        if: failure()
+        run: |
+          echo "Update check failed with exit code ${{ steps.update.outcome }}"
+          echo "Please check the logs for more details."
+          
+          # Add any additional failure handling here
+          
+        continue-on-error: true
+
+      - name: Post notification
+        if: always() && github.event.inputs.skip-notification != 'true'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_SHA } = process.env;
+            const runUrl = `https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}`;
+            const shortSha = GITHUB_SHA.substring(0, 7);
+            const repoUrl = `https://github.com/${GITHUB_REPOSITORY}`;
+            
+            // Get workflow run details
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+            
+            // Get commit details
+            const { data: commit } = await github.rest.repos.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: GITHUB_SHA
+            });
+            
+            // Prepare notification
+            const status = '${{ steps.update.outcome }}';
+            const changesDetected = '${{ steps.git-status.outputs.changes_detected || 'false' }}';
+            const commitMessage = commit.commit.message.split('\n')[0];
+            const author = commit.author ? commit.author.login : commit.commit.author.name;
+            
+            let message = {
+              text: `*${context.workflow}* ${status.toUpperCase()}`,
+              blocks: [
+                {
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text: `*${context.workflow}* ${status.toUpperCase()}`
+                  }
+                },
+                {
+                  type: 'context',
+                  elements: [
+                    {
+                      type: 'mrkdwn',
+                      text: `*Repository:* <${repoUrl}|${GITHUB_REPOSITORY}>\n*Run:* <${runUrl}|#${GITHUB_RUN_ID}>\n*Commit:* <${commit.html_url}|${shortSha}>`
+                    }
+                  ]
+                },
+                {
+                  type: 'section',
+                  fields: [
+                    {
+                      type: 'mrkdwn',
+                      text: `*Author:* ${author}`
+                    },
+                    {
+                      type: 'mrkdwn',
+                      text: `*Branch:* ${context.ref.replace('refs/heads/', '')}`
+                    },
+                    {
+                      type: 'mrkdwn',
+                      text: `*Commit:* ${commitMessage}`
+                    },
+                    {
+                      type: 'mrkdwn',
+                      text: `*Changes:* ${changesDetected === 'true' ? 'Yes' : 'No'}`
+                    }
+                  ]
+                }
+              ]
+            };
+            
+            // Add a divider and status section
+            message.blocks.push({
+              type: 'divider'
+            });
+            
+            if (status === 'success') {
+              message.blocks.push({
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: changesDetected === 'true' 
+                    ? '✅ *Update successful!* The formula has been updated.'
+                    : 'ℹ️ *No updates available.* The formula is up to date.'
+                }
+              });
+            } else {
+              message.blocks.push({
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: '❌ *Update failed!* Please check the logs for details.'
+                }
+              });
+              
+              // Add failed step information if available
+              if (context.job && context.job.steps) {
+                const failedStep = context.job.steps.find(step => step.conclusion === 'failure');
+                if (failedStep) {
+                  message.blocks.push({
+                    type: 'context',
+                    elements: [
+                      {
+                        type: 'mrkdwn',
+                        text: `*Failed step:* ${failedStep.name}`
+                      }
+                    ]
+                  });
+                }
+              }
+            }
+            
+            // Add run time information
+            const startTime = new Date(run.run_started_at);
+            const endTime = new Date();
+            const duration = Math.round((endTime - startTime) / 1000);
+            
+            message.blocks.push({
+              type: 'context',
+              elements: [
+                {
+                  type: 'mrkdwn',
+                  text: `⏱️ Run completed in ${duration} seconds`
+                }
+              ]
+            });
+            
+            // Send notification to Slack if webhook is configured
+            try {
+                await fetch(webhookUrl, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify(message)
+                });
+              } catch (error) {
+                console.error('Failed to send Slack notification:', error);
+              }
+            
+            // Also update the GitHub commit status
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: GITHUB_SHA,
+              state: status === 'success' ? 'success' : 'failure',
+              target_url: runUrl,
+              description: status === 'success' 
+                ? (changesDetected === 'true' ? 'Formula updated' : 'No updates available') 
+                : 'Update failed',
+              context: 'dev-tools/update'
+            });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
